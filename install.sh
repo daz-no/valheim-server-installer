@@ -43,6 +43,18 @@ if [[ "$ARCH" != "x86_64" ]]; then
     exit 1
 fi
 
+# Check if sudo is installed
+if ! command -v sudo > /dev/null 2>&1; then
+    echo "ERROR: sudo is not installed."
+    exit 1
+fi
+
+# Check if the current user has sudo permission
+if ! sudo -v; then
+    echo "ERROR: The current user does not have sudo permission."
+    exit 1
+fi
+
 echo ""
 echo "System check passed!"
 echo "This server is compatible with the installer."
