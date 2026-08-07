@@ -56,5 +56,13 @@ if ! sudo -v; then
 fi
 
 echo ""
+echo "Updating package list..."
+sudo apt update
+
+echo ""
+echo "Installing required packages..."
+sudo apt install -y curl tar lib32gcc-s1 lib32stdc++6 libatomic1 libpulse-mainloop-glib0
+
+echo ""
 echo "System check passed!"
 echo "This server is compatible with the installer."
