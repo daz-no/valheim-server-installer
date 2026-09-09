@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Valheim backup and update
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=valheim-maintenance.service
+[Install]
+WantedBy=timers.target
