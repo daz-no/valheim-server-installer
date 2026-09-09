@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up and update the Valheim Dedicated Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/valheim/maintenance daily
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
