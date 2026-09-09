@@ -17,10 +17,19 @@ for version in 22.04 24.04 26.04; do
 done
 
 make_release ubuntu 24.04
-if VALHEIM_TEST_UNAME_S=Darwin VALHEIM_TEST_UNAME_M=x86_64 VALHEIM_TEST_OS_RELEASE="$temp/os-release" check_platform >/dev/null 2>&1; then exit 1; fi
-if VALHEIM_TEST_UNAME_S=Linux VALHEIM_TEST_UNAME_M=aarch64 VALHEIM_TEST_OS_RELEASE="$temp/os-release" check_platform >/dev/null 2>&1; then exit 1; fi
+if (VALHEIM_TEST_UNAME_S=Darwin VALHEIM_TEST_UNAME_M=x86_64 VALHEIM_TEST_OS_RELEASE="$temp/os-release" check_platform >/dev/null 2>&1); then
+    echo "non-Linux operating systems should be rejected" >&2
+    exit 1
+fi
+if (VALHEIM_TEST_UNAME_S=Linux VALHEIM_TEST_UNAME_M=aarch64 VALHEIM_TEST_OS_RELEASE="$temp/os-release" check_platform >/dev/null 2>&1); then
+    echo "aarch64 should be rejected" >&2
+    exit 1
+fi
 
 make_release debian 13
-if VALHEIM_TEST_UNAME_S=Linux VALHEIM_TEST_UNAME_M=x86_64 VALHEIM_TEST_OS_RELEASE="$temp/os-release" check_platform >/dev/null 2>&1; then exit 1; fi
+if (VALHEIM_TEST_UNAME_S=Linux VALHEIM_TEST_UNAME_M=x86_64 VALHEIM_TEST_OS_RELEASE="$temp/os-release" check_platform >/dev/null 2>&1); then
+    echo "Debian should be rejected" >&2
+    exit 1
+fi
 
 echo 'platform validation tests passed'
