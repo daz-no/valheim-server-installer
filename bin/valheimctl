@@ -1,0 +1,490 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# shellcheck source=/usr/local/lib/valheim/common.sh
+# shellcheck disable=SC1090,SC1091
+source "${VALHEIM_COMMON_PATH:-/usr/local/lib/valheim/common.sh}"
+
+MAINTENANCE="${VALHEIM_MAINTENANCE_PATH:-/usr/local/libexec/valheim/maintenance}"
+
+usage() {
+    cat <<'EOF'
+Usage: sudo valheimctl COMMAND [ARGUMENTS]
+
+Server:
+  status | start | stop | restart | logs [--follow] | info
+  configure
+
+Worlds:
+  world list
+  world new [NAME]
+  world select [NAME]
+  world import
+
+Maintenance:
+  update | backup
+  backup list
+  backup export [ARCHIVE]
+  restore [ARCHIVE]
+  schedule [HH:MM]
+
+Access lists:
+  access {admin|ban|permit} {list|add|remove} [PLATFORM_USER_ID]
+EOF
+}
+
+prompt_default() {
+    local prompt=$1 default=$2 answer
+    read -r -p "$prompt [$default]: " answer
+    printf '%s' "${answer:-$default}"
+}
+
+prompt_yes_no() {
+    local prompt=$1 default=${2:-n} answer suffix
+    if [[ $default == "y" ]]; then suffix="[Y/n]"; else suffix="[y/N]"; fi
+    read -r -p "$prompt $suffix: " answer
+    answer=${answer:-$default}
+    [[ $answer == [Yy] || $answer == [Yy][Ee][Ss] ]]
+}
+
+prompt_password() {
+    local first second
+    while true; do
+        read -r -s -p "Server password (5-64 characters): " first
+        printf '\n' >&2
+        validate_password "$first" || { warn "Password must contain 5 to 64 characters and no newlines."; continue; }
+        read -r -s -p "Confirm password: " second
+        printf '\n' >&2
+        [[ $first == "$second" ]] || { warn "Passwords do not match."; continue; }
+        # Consumed by render_config through the shared configuration interface.
+        # shellcheck disable=SC2034
+        SERVER_PASSWORD=$first
+        return
+    done
+}
+
+normal_user() {
+    local candidate=${SUDO_USER:-}
+    [[ -n $candidate && $candidate != root ]] || die "Run valheimctl through sudo from your normal SSH account."
+    getent passwd "$candidate" >/dev/null || die "Cannot find invoking account: $candidate"
+    printf '%s' "$candidate"
+}
+
+normal_home() {
+    local user=$1
+    getent passwd "$user" | cut -d: -f6
+}
+
+choose_from_array() {
+    local prompt=$1
+    shift
+    local -a values=("$@")
+    local choice index
+    ((${#values[@]} > 0)) || return 1
+    if ((${#values[@]} == 1)); then
+        printf '%s' "${values[0]}"
+        return
+    fi
+    log "$prompt" >&2
+    for index in "${!values[@]}"; do
+        printf '  %d) %s\n' "$((index + 1))" "${values[$index]##*/}" >&2
+    done
+    while true; do
+        read -r -p "Selection: " choice
+        if [[ $choice =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#values[@]} )); then
+            printf '%s' "${values[$((choice - 1))]}"
+            return
+        fi
+        warn "Enter a number from 1 to ${#values[@]}."
+    done
+}
+
+save_and_restart() {
+    local was_active=0
+    service_was_active && was_active=1
+    save_config
+    restart_if_active "$was_active"
+}
+
+configure_server() {
+    require_root
+    load_config
+    local value backend_choice public_choice
+
+    while true; do
+        value=$(prompt_default "Server display name" "$SERVER_NAME")
+        validate_display_name "$value" && { SERVER_NAME=$value; break; }
+        warn "Use 1-64 characters without slashes or newlines."
+    done
+
+    if prompt_yes_no "Change the server password?" n; then
+        prompt_password
+    fi
+
+    while true; do
+        value=$(prompt_default "UDP base port" "$SERVER_PORT")
+        validate_port "$value" && { SERVER_PORT=$value; break; }
+        warn "Use a port from 1024 through 65534."
+    done
+
+    log "Backend: 1) Steam only  2) Crossplay"
+    read -r -p "Selection [$( [[ $SERVER_BACKEND == steam ]] && echo 1 || echo 2 )]: " backend_choice
+    backend_choice=${backend_choice:-$( [[ $SERVER_BACKEND == steam ]] && echo 1 || echo 2 )}
+    case "$backend_choice" in
+        1) SERVER_BACKEND=steam ;;
+        2) SERVER_BACKEND=crossplay ;;
+        *) die "Invalid backend selection." ;;
+    esac
+
+    public_choice=$(prompt_yes_no "List the server publicly?" "$( [[ $SERVER_PUBLIC == 1 ]] && echo y || echo n )" && echo 1 || echo 0)
+    SERVER_PUBLIC=$public_choice
+    save_and_restart
+    log "Configuration saved."
+}
+
+world_paths() {
+    local -n result=$1
+    local base
+    result=()
+    while IFS= read -r -d '' base; do result+=("$base"); done < <(list_world_pairs "$VALHEIM_WORLDS_DIR")
+}
+
+stop_backup_change_start() {
+    local operation=$1
+    shift
+    local was_active=0
+    service_was_active && was_active=1
+    if [[ $was_active == 1 ]]; then systemctl stop "$VALHEIM_SERVICE"; fi
+    if ! "$MAINTENANCE" backup-stopped; then
+        restart_if_active "$was_active"
+        die "Safety backup failed; no world changes were made."
+    fi
+    if ! "$operation" "$@"; then
+        restart_if_active "$was_active"
+        die "World operation failed."
+    fi
+    restart_if_active "$was_active"
+}
+
+set_world_config() {
+    WORLD_NAME=$1
+    save_config
+}
+
+world_list() {
+    local -a worlds
+    local path marker
+    load_config
+    world_paths worlds
+    if ((${#worlds[@]} == 0)); then
+        log "No complete world pairs found in $VALHEIM_WORLDS_DIR"
+        return
+    fi
+    for path in "${worlds[@]}"; do
+        marker=" "
+        [[ ${path##*/} == "$WORLD_NAME" ]] && marker="*"
+        printf '%s %s\n' "$marker" "${path##*/}"
+    done
+}
+
+world_select() {
+    require_root
+    load_config
+    local requested=${1:-} selected path
+    local -a worlds names
+    world_paths worlds
+    ((${#worlds[@]} > 0)) || die "No complete world pairs are installed."
+    if [[ -n $requested ]]; then
+        validate_world_name "$requested" || die "Invalid world name."
+        [[ -f "$VALHEIM_WORLDS_DIR/$requested.db" && -f "$VALHEIM_WORLDS_DIR/$requested.fwl" ]] \
+            || die "World '$requested' is not installed as a complete pair."
+        selected=$requested
+    else
+        for path in "${worlds[@]}"; do names+=("${path##*/}"); done
+        selected=$(choose_from_array "Choose a world:" "${names[@]}")
+    fi
+    [[ $selected == "$WORLD_NAME" ]] && { log "World '$selected' is already active."; return; }
+    stop_backup_change_start set_world_config "$selected"
+    log "Active world changed to: $selected"
+}
+
+world_new() {
+    require_root
+    load_config
+    local name=${1:-}
+    while [[ -z $name ]]; do
+        read -r -p "New world name: " name
+        validate_world_name "$name" || { warn "Use 1-64 characters without slashes or newlines."; name=""; }
+    done
+    validate_world_name "$name" || die "Invalid world name."
+    [[ ! -e "$VALHEIM_WORLDS_DIR/$name.db" && ! -e "$VALHEIM_WORLDS_DIR/$name.fwl" ]] \
+        || die "World files already exist for '$name'; use 'world select'."
+    stop_backup_change_start set_world_config "$name"
+    log "Valheim will generate '$name' when the service starts."
+}
+
+copy_world_pair() {
+    local source_base=$1 name
+    name=${source_base##*/}
+    install -o "$VALHEIM_USER" -g "$VALHEIM_GROUP" -m 0600 "$source_base.db" "$VALHEIM_WORLDS_DIR/$name.db"
+    install -o "$VALHEIM_USER" -g "$VALHEIM_GROUP" -m 0600 "$source_base.fwl" "$VALHEIM_WORLDS_DIR/$name.fwl"
+    set_world_config "$name"
+}
+
+world_import() {
+    require_root
+    load_config
+    local admin home upload selected name
+    local -a pairs
+    admin=$(normal_user)
+    home=$(normal_home "$admin")
+    upload="$home/valheim-world-upload"
+    install -d -o "$admin" -g "$(id -gn "$admin")" -m 0700 "$upload"
+    while IFS= read -r -d '' selected; do pairs+=("$selected"); done < <(list_world_pairs "$upload")
+    ((${#pairs[@]} > 0)) || die "No complete .db/.fwl pair found in $upload"
+    selected=$(choose_from_array "Choose the uploaded world to import:" "${pairs[@]}")
+    name=${selected##*/}
+    if [[ -e "$VALHEIM_WORLDS_DIR/$name.db" || -e "$VALHEIM_WORLDS_DIR/$name.fwl" ]]; then
+        prompt_yes_no "Installed files for '$name' exist. Back them up and replace them?" n \
+            || die "Import cancelled."
+    fi
+    stop_backup_change_start copy_world_pair "$selected"
+    log "Imported and selected world: $name"
+    log "The upload copies remain in $upload until you remove them."
+}
+
+backup_archives() {
+    # The caller always supplies the name of an array result variable.
+    # shellcheck disable=SC2178
+    local -n result=$1
+    local archive
+    result=()
+    while IFS= read -r archive; do [[ -n $archive ]] && result+=("$archive"); done \
+        < <(find "$VALHEIM_BACKUP_DIR" -maxdepth 1 -type f -name 'valheim-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null \
+            | sort -rn | cut -d' ' -f2-)
+}
+
+select_archive() {
+    local requested=${1:-} archive
+    local -a archives
+    backup_archives archives
+    ((${#archives[@]} > 0)) || die "No backups found."
+    if [[ -n $requested ]]; then
+        archive=$(realpath -e -- "$requested") || die "Backup does not exist."
+        [[ $archive == "$VALHEIM_BACKUP_DIR"/* ]] || die "Select an archive from $VALHEIM_BACKUP_DIR"
+        printf '%s' "$archive"
+    else
+        choose_from_array "Choose a backup:" "${archives[@]}"
+    fi
+}
+
+backup_list() {
+    local -a archives
+    local archive
+    backup_archives archives
+    ((${#archives[@]} > 0)) || { log "No backups found."; return; }
+    for archive in "${archives[@]}"; do
+        printf '%s\n' "$archive"
+    done
+}
+
+backup_export() {
+    require_root
+    local archive admin home destination
+    archive=$(select_archive "${1:-}")
+    admin=$(normal_user)
+    home=$(normal_home "$admin")
+    destination="$home/valheim-backup-downloads"
+    install -d -o "$admin" -g "$(id -gn "$admin")" -m 0700 "$destination"
+    install -o "$admin" -g "$(id -gn "$admin")" -m 0600 "$archive" "$destination/${archive##*/}"
+    [[ ! -f "$archive.sha256" ]] || install -o "$admin" -g "$(id -gn "$admin")" -m 0600 \
+        "$archive.sha256" "$destination/${archive##*/}.sha256"
+    log "Exported for WinSCP download: $destination/${archive##*/}"
+}
+
+restore_backup() {
+    require_root
+    local archive source_archive temp old was_active=0 rollback=1 world_moved=0 state_saved=0 entry
+    archive=$(select_archive "${1:-}")
+    [[ ! -f "$archive.sha256" ]] || (cd "$VALHEIM_BACKUP_DIR" && sha256sum -c "${archive##*/}.sha256")
+    tar -tzf "$archive" >/dev/null || die "Backup archive is unreadable."
+    while IFS= read -r entry; do
+        [[ $entry != /* && $entry != *../* ]] || die "Unsafe path in backup archive."
+        case "$entry" in
+            etc/valheim/server.conf|var/lib/valheim/worlds_local|var/lib/valheim/worlds_local/*|var/lib/valheim/*list.txt) ;;
+            *) die "Unexpected path in backup archive: $entry" ;;
+        esac
+    done < <(tar -tzf "$archive")
+    prompt_yes_no "Restore ${archive##*/}? Current data will be safety-backed up first." n || die "Restore cancelled."
+
+    temp=$(mktemp -d)
+    source_archive="$temp/restore.tar.gz"
+    cp -- "$archive" "$source_archive"
+    service_was_active && was_active=1
+    [[ $was_active == 0 ]] || systemctl stop "$VALHEIM_SERVICE"
+    if ! "$MAINTENANCE" backup-stopped; then
+        restart_if_active "$was_active"
+        rm -rf -- "$temp"
+        die "Could not create the pre-restore safety backup."
+    fi
+    if ! old=$(mktemp -d "$VALHEIM_HOME/.restore-old.XXXXXX"); then
+        restart_if_active "$was_active"
+        rm -rf -- "$temp"
+        die "Could not prepare restore rollback storage."
+    fi
+
+    rollback_restore() {
+        if [[ $rollback == 1 ]]; then
+            warn "Restore failed; putting the previous world and configuration back."
+            if [[ $world_moved == 1 ]]; then
+                rm -rf -- "$VALHEIM_WORLDS_DIR"
+                [[ ! -d "$old/worlds_local" ]] || mv -- "$old/worlds_local" "$VALHEIM_WORLDS_DIR"
+            fi
+            if [[ $state_saved == 1 ]]; then
+                install -o root -g "$VALHEIM_GROUP" -m 0640 "$old/server.conf" "$VALHEIM_CONFIG"
+                for entry in adminlist.txt bannedlist.txt permittedlist.txt; do
+                    [[ ! -f "$old/$entry" ]] || install -o "$VALHEIM_USER" -g "$VALHEIM_GROUP" -m 0640 \
+                        "$old/$entry" "$VALHEIM_HOME/$entry"
+                done
+            fi
+        fi
+        rm -rf -- "$temp" "$old"
+        restart_if_active "$was_active"
+    }
+    trap rollback_restore EXIT
+
+    tar -C "$temp" -xzf "$source_archive"
+    load_config "$temp/etc/valheim/server.conf"
+    [[ -d "$temp/var/lib/valheim/worlds_local" ]] || die "Backup has no worlds directory."
+    cp -- "$VALHEIM_CONFIG" "$old/server.conf"
+    for entry in adminlist.txt bannedlist.txt permittedlist.txt; do
+        [[ ! -f "$VALHEIM_HOME/$entry" ]] || cp -- "$VALHEIM_HOME/$entry" "$old/$entry"
+    done
+    state_saved=1
+    mv -- "$VALHEIM_WORLDS_DIR" "$old/worlds_local"
+    world_moved=1
+    install -d -o "$VALHEIM_USER" -g "$VALHEIM_GROUP" -m 0750 "$VALHEIM_WORLDS_DIR"
+    cp -a -- "$temp/var/lib/valheim/worlds_local/." "$VALHEIM_WORLDS_DIR/"
+    chown -R "$VALHEIM_USER:$VALHEIM_GROUP" "$VALHEIM_WORLDS_DIR"
+    find "$VALHEIM_WORLDS_DIR" -type d -exec chmod 0750 {} +
+    find "$VALHEIM_WORLDS_DIR" -type f -exec chmod 0600 {} +
+    install -o root -g "$VALHEIM_GROUP" -m 0640 "$temp/etc/valheim/server.conf" "$VALHEIM_CONFIG"
+    for entry in adminlist.txt bannedlist.txt permittedlist.txt; do
+        if [[ -f "$temp/var/lib/valheim/$entry" ]]; then
+            install -o "$VALHEIM_USER" -g "$VALHEIM_GROUP" -m 0640 "$temp/var/lib/valheim/$entry" "$VALHEIM_HOME/$entry"
+        fi
+    done
+    rollback=0
+    trap - EXIT
+    rm -rf -- "$temp" "$old"
+    restart_if_active "$was_active"
+    log "Restore completed: ${archive##*/}"
+}
+
+set_schedule() {
+    require_root
+    local value=${1:-}
+    [[ -n $value ]] || read -r -p "Daily maintenance time (HH:MM) [04:00]: " value
+    value=${value:-04:00}
+    [[ $value =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "Time must use 24-hour HH:MM format."
+    install -d -o root -g root -m 0755 /etc/systemd/system/valheim-maintenance.timer.d
+    write_managed_file root root 0644 /etc/systemd/system/valheim-maintenance.timer.d/schedule.conf <<EOF
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* $value:00
+EOF
+    systemctl daemon-reload
+    systemctl restart valheim-maintenance.timer
+    log "Daily maintenance scheduled for $value server-local time."
+}
+
+access_list() {
+    require_root
+    local kind=${1:-} action=${2:-} identifier=${3:-} filename temp was_active=0
+    case "$kind" in
+        admin) filename=adminlist.txt ;;
+        ban) filename=bannedlist.txt ;;
+        permit) filename=permittedlist.txt ;;
+        *) die "Access list must be admin, ban, or permit." ;;
+    esac
+    local path="$VALHEIM_HOME/$filename"
+    touch "$path"
+    chown "$VALHEIM_USER:$VALHEIM_GROUP" "$path"
+    chmod 0640 "$path"
+    case "$action" in
+        list) cat "$path" ;;
+        add|remove)
+            [[ $identifier =~ ^[A-Za-z]+_[A-Za-z0-9_-]+$ ]] \
+                || die "Use a case-sensitive Platform_UserID such as Steam_123456789."
+            temp=$(mktemp)
+            if [[ $action == add ]]; then
+                { cat "$path"; grep -Fxq "$identifier" "$path" || printf '%s\n' "$identifier"; } | awk 'NF && !seen[$0]++' > "$temp"
+            else
+                grep -Fvx "$identifier" "$path" > "$temp" || true
+            fi
+            install -o "$VALHEIM_USER" -g "$VALHEIM_GROUP" -m 0640 "$temp" "$path"
+            rm -f -- "$temp"
+            service_was_active && was_active=1
+            restart_if_active "$was_active"
+            log "Updated $kind access list."
+            ;;
+        *) die "Action must be list, add, or remove." ;;
+    esac
+}
+
+show_info() {
+    load_config
+    cat <<EOF
+Server name: $SERVER_NAME
+World:       $WORLD_NAME
+Backend:     $SERVER_BACKEND
+Visibility:  $( [[ $SERVER_PUBLIC == 1 ]] && echo listed || echo unlisted )
+UDP ports:   $SERVER_PORT-$((SERVER_PORT + 1))
+World data:  $VALHEIM_WORLDS_DIR
+Backups:     $VALHEIM_BACKUP_DIR
+EOF
+    if [[ $SERVER_BACKEND == steam ]]; then
+        log "Allow UDP $SERVER_PORT-$((SERVER_PORT + 1)) in the VPS firewall/security group."
+    else
+        log "Crossplay uses PlayFab relay; inspect logs for the join code."
+    fi
+}
+
+command=${1:-help}
+shift || true
+
+case "$command" in
+    help|-h|--help) usage ;;
+    status) systemctl status "$VALHEIM_SERVICE" --no-pager ;;
+    start|stop|restart) require_root; systemctl "$command" "$VALHEIM_SERVICE" ;;
+    logs)
+        if [[ ${1:-} == "--follow" ]]; then journalctl -u "$VALHEIM_SERVICE" -f
+        else journalctl -u "$VALHEIM_SERVICE" -n 100 --no-pager; fi
+        ;;
+    info) show_info ;;
+    configure) configure_server ;;
+    world)
+        subcommand=${1:-}; shift || true
+        case "$subcommand" in
+            list) world_list ;;
+            new) world_new "${1:-}" ;;
+            select) world_select "${1:-}" ;;
+            import) world_import ;;
+            *) die "Usage: valheimctl world {list|new|select|import}" ;;
+        esac
+        ;;
+    update) require_root; "$MAINTENANCE" update ;;
+    backup)
+        subcommand=${1:-create}; shift || true
+        case "$subcommand" in
+            create) require_root; "$MAINTENANCE" backup ;;
+            list) backup_list ;;
+            export) backup_export "${1:-}" ;;
+            *) die "Usage: valheimctl backup [list|export [ARCHIVE]]" ;;
+        esac
+        ;;
+    restore) restore_backup "${1:-}" ;;
+    schedule) set_schedule "${1:-}" ;;
+    access) access_list "${1:-}" "${2:-}" "${3:-}" ;;
+    *) usage >&2; exit 1 ;;
+esac
